@@ -7,6 +7,7 @@
     <artifactId>soap-client</artifactId>
     <packaging>bundle</packaging>
     <name>soap-client - XML based SOAP client</name>
+    <version>1.0.1-SNAPSHOT</version>
 
     <parent>
         <groupId>org.reficio</groupId>
@@ -16,17 +17,25 @@
     </parent>
 
     <dependencies>
-
         <dependency>
             <groupId>org.apache.httpcomponents</groupId>
             <artifactId>httpclient</artifactId>
             <version>4.5</version>
         </dependency>
-
+        <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpcore-nio</artifactId>
+            <version>4.4.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.httpcomponents</groupId>
+            <artifactId>httpasyncclient</artifactId>
+            <version>4.1</version>
+        </dependency>
         <dependency>
             <groupId>org.reficio</groupId>
             <artifactId>soap-builder</artifactId>
-            <version>${project.version}</version>
+            <version>1.0.0-SNAPSHOT</version>
         </dependency>
         <dependency>
             <groupId>junit</groupId>

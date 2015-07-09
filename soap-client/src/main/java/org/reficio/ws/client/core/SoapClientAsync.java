@@ -1,15 +1,15 @@
 /**
  * Copyright (c) 2012-2013 Reficio (TM) - Reestablish your software!. All Rights Reserved.
- *
+ * <p>
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -25,24 +25,30 @@ import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.Credentials;
 import org.apache.http.auth.NTCredentials;
 import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.AuthCache;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.config.RegistryBuilder;
-import org.apache.http.conn.ConnectTimeoutException;
-import org.apache.http.conn.HttpClientConnectionManager;
 import org.apache.http.conn.routing.HttpRoute;
 import org.apache.http.conn.routing.HttpRoutePlanner;
 import org.apache.http.conn.routing.RouteInfo;
 import org.apache.http.conn.socket.ConnectionSocketFactory;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.auth.BasicScheme;
+import org.apache.http.impl.client.BasicAuthCache;
 import org.apache.http.impl.client.BasicCredentialsProvider;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.conn.DefaultSchemePortResolver;
-import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
+import org.apache.http.impl.nio.client.HttpAsyncClientBuilder;
+import org.apache.http.impl.nio.client.HttpAsyncClients;
+import org.apache.http.impl.nio.conn.PoolingNHttpClientConnectionManager;
+import org.apache.http.impl.nio.reactor.DefaultConnectingIOReactor;
+import org.apache.http.impl.nio.reactor.IOReactorConfig;
+import org.apache.http.nio.conn.NHttpClientConnectionManager;
+import org.apache.http.nio.reactor.ConnectingIOReactor;
+import org.apache.http.nio.reactor.IOReactorException;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.EntityUtils;
 import org.reficio.ws.SoapException;
@@ -58,6 +64,9 @@ import java.nio.charset.Charset;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -75,9 +84,9 @@ import static org.reficio.ws.client.core.SoapConstants.*;
  * @since 1.0.0
  */
 @ThreadSafe
-public final class SoapClient {
+public final class SoapClientAsync {
 
-    private final static Log log = LogFactory.getLog(SoapClient.class);
+    private final static Log log = LogFactory.getLog(SoapClientAsync.class);
 
     private final static String NULL_SOAP_ACTION = null;
 
@@ -107,7 +116,7 @@ public final class SoapClient {
      * @param requestEnvelope SOAP message envelope
      * @return The result returned by the SOAP server
      */
-    public String post(String requestEnvelope) {
+    public Callable<String> post(String requestEnvelope) {
         return post(NULL_SOAP_ACTION, requestEnvelope);
     }
 
@@ -118,10 +127,10 @@ public final class SoapClient {
      * @param requestEnvelope SOAP message envelope
      * @return The result returned by the SOAP server
      */
-    public String post(String soapAction, String requestEnvelope) {
+    public Callable<String> post(String soapAction, String requestEnvelope) {
         log.debug(String.format("Sending request to host=[%s] action=[%s] request:%n%s", endpointUri.toString(),
                 soapAction, requestEnvelope));
-        String response = transmit(soapAction, requestEnvelope);
+        Callable<String> response = transmit(soapAction, requestEnvelope);
         log.debug("Received response:\n" + requestEnvelope);
         return response;
     }
@@ -133,8 +142,19 @@ public final class SoapClient {
      * @link http://docs.oracle.com/javase/1.5.0/docs/guide/net/http-keepalive.html
      */
     public void disconnect() {
-        if (client != null) {
-            client.getConnectionManager().shutdown();
+        if (client.isRunning()) {
+            try {
+                client.close();
+            } catch (IOException e) {
+                log.debug(e.getLocalizedMessage(), e);
+            }
+        }
+        if (connectionManager != null) {
+            try {
+                connectionManager.shutdown();
+            } catch (IOException e) {
+                log.debug(e.getLocalizedMessage(), e);
+            }
         }
     }
 
@@ -180,95 +200,151 @@ public final class SoapClient {
         return post;
     }
 
-    private String transmit(String soapAction, String data) {
+    private Callable<String> transmit(String soapAction, String data) {
         HttpPost post = generatePost(soapAction, data);
         return executePost(post);
     }
 
-    private String executePost(HttpPost post) {
-        try {
-            HttpResponse response = client.execute(post);
-            StatusLine statusLine = response.getStatusLine();
-            HttpEntity entity = response.getEntity();
-            if (statusLine.getStatusCode() >= 300) {
-                EntityUtils.consume(entity);
-                throw new TransmissionException(statusLine.getReasonPhrase(), statusLine.getStatusCode());
+    private static class ParseResultCallable implements Callable<String> {
+        final Future<HttpResponse> futureResponse;
+
+        private ParseResultCallable(Future<HttpResponse> futureRespone) {
+            this.futureResponse = futureRespone;
+        }
+
+        @Override
+        public String call() {
+            HttpEntity entity = null;
+            StatusLine statusLine = null;
+            HttpResponse response = null;
+            try {
+                response = this.futureResponse.get();
+                statusLine = response.getStatusLine();
+                entity = response.getEntity();
+                if (statusLine.getStatusCode() >= 300) {
+                    EntityUtils.consume(entity);
+                    throw new TransmissionException(statusLine.getReasonPhrase(), statusLine.getStatusCode());
+                }
+                return entity == null ? null : EntityUtils.toString(entity);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } catch (ExecutionException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                throw new TransmissionException("Transmission failed", e);
             }
-            return entity == null ? null : EntityUtils.toString(entity);
+            return null;
+        }
+    }
+
+
+    private Callable<String> executePost(HttpPost post) {
+        Callable<String> ret = null;
+        try {
+            if (!client.isRunning()) {
+                client.start();
+            }
+            Future<HttpResponse> futureResponse = client.execute(post, clientContext, null);
+            ret = new ParseResultCallable(futureResponse);
         } catch (SoapException ex) {
             throw ex;
-        } catch (ConnectTimeoutException ex) {
-            throw new TransmissionException("Connection timed out", ex);
-        } catch (IOException ex) {
-            throw new TransmissionException("Transmission failed", ex);
         } catch (RuntimeException ex) {
             post.abort();
             throw new TransmissionException("Transmission aborted", ex);
         }
+        return ret;
     }
+
+    static IOReactorConfig ioReactorConfig;
+    static ConnectingIOReactor ioReactor;
+
+    private HttpClientContext clientContext;
+    private NHttpClientConnectionManager connectionManager;
+    private RequestConfig.Builder requestConfig;
+
+
+    private CloseableHttpAsyncClient client;
+    private RegistryBuilder<ConnectionSocketFactory> socketFactoryRegistry;
+    private HttpAsyncClientBuilder asyncClientBuilder;
 
     // ----------------------------------------------------------------
     // INITIALIZATION API
     // ----------------------------------------------------------------
-    private HttpClientConnectionManager connectionManager;
-    private HttpClientContext clientContext;
-    private RegistryBuilder<ConnectionSocketFactory> socketFactoryRegistry;
-    private RequestConfig.Builder requestConfig;
-    private HttpClientBuilder builder;
-    private CloseableHttpClient client;
-
     private void initialize() {
-        clientContext = HttpClientContext.create();
-        requestConfig = RequestConfig.custom()
+
+        this.clientContext = HttpClientContext.create();
+        this.asyncClientBuilder = HttpAsyncClients.custom();
+        this.requestConfig = RequestConfig.custom()
                 .setConnectionRequestTimeout(connectTimeoutInMillis)
                 .setSocketTimeout(readTimeoutInMillis);
-
-        builder = HttpClientBuilder.create();
-        configureAuthentication(endpointUri, endpointProperties);
-        configureAuthentication(proxyUri, proxyProperties);
+        configureAuthenticationContext(this.clientContext, endpointUri, endpointProperties);
+        configureAuthenticationContext(this.clientContext, proxyUri, proxyProperties);
 
         SSLConnectionSocketFactory factory = null;
         int port;
         try {
-
-            if (endpointTlsEnabled || proxyTlsEnabled) {
-                builder.setSchemePortResolver(DefaultSchemePortResolver.INSTANCE);
-                if (endpointTlsEnabled && proxyTlsEnabled) {
-                    factory = SSLUtils.getMergedSocketFactory(endpointProperties, proxyProperties);
-                } else if (endpointTlsEnabled) {
-                    factory = SSLUtils.getFactory(endpointProperties);
-                    port = endpointUri.getPort();
-                } else if (proxyTlsEnabled) {
-                    factory = SSLUtils.getFactory(proxyProperties);
-                    port = proxyUri.getPort();
-                }
+            if (endpointTlsEnabled && proxyTlsEnabled) {
+                factory = SSLUtils.getMergedSocketFactory(endpointProperties, proxyProperties);
+//                registerTlsScheme(factory, proxyUri.getPort());
+                this.asyncClientBuilder.setSchemePortResolver(DefaultSchemePortResolver.INSTANCE);
+            } else if (endpointTlsEnabled) {
+                factory = SSLUtils.getFactory(endpointProperties);
+                port = endpointUri.getPort();
+//                registerTlsScheme(factory, port);
+                this.asyncClientBuilder.setSchemePortResolver(DefaultSchemePortResolver.INSTANCE);
+            } else if (proxyTlsEnabled) {
+                factory = SSLUtils.getFactory(proxyProperties);
+                port = proxyUri.getPort();
+//                registerTlsScheme(factory, port);
+                this.asyncClientBuilder.setSchemePortResolver(DefaultSchemePortResolver.INSTANCE);
             }
-            if (factory != null) {
-                builder.setSSLSocketFactory(factory);
-                socketFactoryRegistry = RegistryBuilder.create();
-                socketFactoryRegistry.register(HTTPS, factory);
-
-                connectionManager = new PoolingHttpClientConnectionManager(socketFactoryRegistry.build());
-            } else {
-                connectionManager = new PoolingHttpClientConnectionManager();
-            }
-            ((PoolingHttpClientConnectionManager)connectionManager).setDefaultMaxPerRoute(maxConnectionsPerRoute);
-            ((PoolingHttpClientConnectionManager)connectionManager).setMaxTotal(maxConnectionsTotal);
         } catch (GeneralSecurityException ex) {
             throw new SoapClientException(ex);
         }
 
-        configureProxy(this.requestConfig);
-        clientContext.setRequestConfig(this.requestConfig.build());
-        builder.setConnectionManager(connectionManager);
-        client = builder.build();
+        configureProxy(this.proxyUri, this.proxyTlsEnabled, this.endpointTlsEnabled, this.asyncClientBuilder, this.requestConfig);
+
+        clientContext.setRequestConfig(requestConfig.build());
+
+        if (ioReactorConfig == null) {
+            // Create I/O reactor configuration
+            ioReactorConfig = IOReactorConfig.custom()
+                    .setIoThreadCount(Runtime.getRuntime().availableProcessors())
+                    .setConnectTimeout(this.connectTimeoutInMillis)
+                    .setSoTimeout(this.readTimeoutInMillis)
+                    .build();
+        }
+
+        if (ioReactor == null) {
+            try {
+                ioReactor = new DefaultConnectingIOReactor(ioReactorConfig);
+            } catch (IOReactorException e) {
+                log.warn(e.getLocalizedMessage(), e);
+            }
+        }
+
+        // Create a custom I/O reactort
+        connectionManager = new PoolingNHttpClientConnectionManager(ioReactor);
+        ((PoolingNHttpClientConnectionManager) connectionManager).setDefaultMaxPerRoute(this.maxConnectionsPerRoute);
+        ((PoolingNHttpClientConnectionManager) connectionManager).setMaxTotal(this.maxConnectionsTotal);
+        this.asyncClientBuilder
+                .setConnectionManager(connectionManager)
+                .setConnectionManagerShared(false);
+
+        //TODO: fix socketFactoryRegistry setup
+//        if (factory != null) {
+//            socketFactoryRegistry = RegistryBuilder.create();
+//            socketFactoryRegistry.register(HTTPS, factory);
+//            connectionManager = new PoolingNHttpClientConnectionManager(socketFactoryRegistry.build());
+//        } else {
+//            connectionManager = new PoolingNHttpClientConnectionManager();
+//        }
+        client = this.asyncClientBuilder.build();
     }
 
-    private HttpClientBuilder configureAuthentication(URI uri, Security security) {
-        if (this.builder == null) {
-            builder = HttpClientBuilder.create();
-        }
+    private static void configureAuthenticationContext(HttpClientContext context, URI uri, Security security) {
         if (security.isAuthEnabled()) {
+            HttpHost target = new HttpHost(uri.getHost(), uri.getPort(), uri.getScheme());
             AuthScope scope = new AuthScope(uri.getHost(), uri.getPort(), AuthScope.ANY_REALM);
             Credentials credentials = null;
             if (security.isAuthBasic()) {
@@ -281,14 +357,19 @@ public final class SoapClient {
             } else if (security.isAuthSpnego()) {
                 // TODO
             }
-            CredentialsProvider provider = new BasicCredentialsProvider();
+            BasicCredentialsProvider provider = new BasicCredentialsProvider();
             provider.setCredentials(scope, credentials);
-            builder.setDefaultCredentialsProvider(provider);
+            context.setCredentialsProvider(provider);
+            AuthCache authCache = new BasicAuthCache();
+            BasicScheme basicAuth = new BasicScheme();
+            authCache.put(target, basicAuth);
+            context.setAuthCache(authCache);
         }
-        return builder;
     }
-
-    private void configureProxy(RequestConfig.Builder requestConfig) {
+    private static void configureProxy(URI proxyUri, Boolean proxyTlsEnabled, Boolean endpointTlsEnabled,
+                                       HttpAsyncClientBuilder asyncClientBuilder,
+                                       RequestConfig.Builder requestConfig
+    ) {
         if (proxyUri == null) {
             return;
         }
@@ -299,7 +380,7 @@ public final class SoapClient {
             // To make the HttpClient talk to a HTTP End-site through an HTTPS Proxy, the route should be secure,
             //  but there should not be any Tunnelling or Layering.
             if (!endpointTlsEnabled) {
-                builder.setRoutePlanner(new HttpRoutePlanner() {
+                asyncClientBuilder.setRoutePlanner(new HttpRoutePlanner() {
                     @Override
                     public HttpRoute determineRoute(HttpHost target, HttpRequest request, HttpContext context) {
                         return new HttpRoute(target, null, proxy, true, RouteInfo.TunnelType.PLAIN, RouteInfo.LayerType.PLAIN);
@@ -314,11 +395,14 @@ public final class SoapClient {
         }
     }
 
+    public CloseableHttpAsyncClient getClient() {
+        return client;
+    }
 
     // ----------------------------------------------------------------
     // BUILDER API
     // ----------------------------------------------------------------
-    private SoapClient() {
+    private SoapClientAsync() {
     }
 
     /**
@@ -435,7 +519,6 @@ public final class SoapClient {
             return this;
         }
 
-
         /**
          * @param value {@link Security} object to be applied to requests. Null is not accepted.
          * @return builder
@@ -473,6 +556,8 @@ public final class SoapClient {
             connectTimeoutInMillis = value;
             return this;
         }
+
+
         /**
          * @param value Specifies the maximum number of connections per route. Has to be greater than 0.
          * @return builder
@@ -491,18 +576,17 @@ public final class SoapClient {
             maxConnectionsTotal = value;
             return this;
         }
-
         /**
          * Constructs properly populated soap client
          *
          * @return properly populated soap clients
          */
-        public SoapClient build() {
+        public SoapClientAsync build() {
             return initializeClient();
         }
 
-        private SoapClient initializeClient() {
-            SoapClient client = new SoapClient();
+        private SoapClientAsync initializeClient() {
+            SoapClientAsync client = new SoapClientAsync();
             client.endpointUri = endpointUri;
             if (endpointProperties == null) {
                 endpointProperties = Security.builder().build();
